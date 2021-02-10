@@ -9,7 +9,10 @@
 #include "tensorflow/lite/interpreter.h"
 #include "tensorflow/lite/kernels/register.h"
 #include "tensorflow/lite/model.h"
+#include "tensorflow/lite/optional_debug_tools.h"
 #include "tensorflow/lite/tools/gen_op_registration.h"
+
+#include "transpose_conv_bias.h"
 
 using namespace std;
 
@@ -19,6 +22,7 @@ int model_channels;
 
 std::unique_ptr<tflite::Interpreter> interpreter;
 
+cv::Mat getTensorMat(int tnum, int debug);
 void GetImageTFLite(float* out, cv::Mat &src);
 void detect_from_video(cv::Mat &src);
 
@@ -30,6 +34,32 @@ struct RGB {
 
 const RGB maskColor[2] = {{  0,   0,   0},  //background
                           {255, 255, 255}}; //person
+
+#define TFLITE_MINIMAL_CHECK(x)                              \
+  if (!(x)) {                                                \
+	fprintf(stderr, "Error at %s:%d\n", __FILE__, __LINE__); \
+	exit(1);                                                 \
+  }
+
+cv::Mat getTensorMat(int tnum, int debug) {
+    using namespace tflite;
+    
+	TfLiteType t_type = interpreter->tensor(tnum)->type;
+	TFLITE_MINIMAL_CHECK(t_type == kTfLiteFloat32);
+
+	TfLiteIntArray* dims = interpreter->tensor(tnum)->dims;
+	if (debug) for (int i = 0; i < dims->size; i++) printf("tensor #%d: %d\n",tnum,dims->data[i]);
+	TFLITE_MINIMAL_CHECK(dims->data[0] == 1);
+
+	int h = dims->data[1];
+	int w = dims->data[2];
+	int c = dims->data[3];
+
+	float* p_data = interpreter->typed_tensor<float>(tnum);
+	TFLITE_MINIMAL_CHECK(p_data != nullptr);
+
+	return cv::Mat(h,w,CV_32FC(c),p_data);
+}
 
 void GetImageTFLite(float* out, cv::Mat &src)
 {
@@ -43,19 +73,15 @@ void GetImageTFLite(float* out, cv::Mat &src)
     cv::resize(src, image, cv::Size(model_width, model_height), cv::INTER_AREA);
 
     in=image.data;
-    Len=image.rows*image.cols*image.channels();
+    Len=image.rows * image.cols * image.channels();
     for(i=0;i<Len;i++){
-        f     =in[i];
-        out[i]=(f - 127.5f) / 127.5f;
+        f      = in[i];
+        out[i] = f / 255.0f;
     }
 }
 
 void detect_from_video(cv::Mat &src)
 {
-    int i,j,k,mi;
-    float mx,v;
-    float *data;
-    RGB *rgb;
     static cv::Mat image;
     static cv::Mat frame(model_width, model_height, CV_8UC3);
     static cv::Mat blend(src.cols   , src.rows    , CV_8UC3);
@@ -65,37 +91,41 @@ void detect_from_video(cv::Mat &src)
     interpreter->Invoke();      // run your model
 
     // get max object per pixel
-    data = interpreter->tensor(interpreter->outputs()[0])->data.f;
-    rgb = (RGB *)frame.data;
+    //data = interpreter->tensor(interpreter->outputs()[0])->data.f;
+    cv::Mat output = getTensorMat(interpreter->outputs()[0], 0);
+    cv::Mat ofinal(output.rows, output.cols,CV_8UC1);
+    float* tmp = (float*)output.data;
+    uint8_t* out = (uint8_t*)ofinal.data;
 
-    for(i = 0; i < model_height; i++){
-        for(j = 0; j < model_width; j++){
-            for(mi = -1, mx = 0.0, k = 0; k < 21; k++){
-                v = data[21 * (i * model_width + j) + k];
-                if(v > mx){ mi = k; mx = v; }
-            }
-            if(mi == 15)
-                rgb[j + i * model_width] = maskColor[1];
-            else
-                rgb[j + i * model_width] = maskColor[0];
-        }
+    for (unsigned int n = 0; n < output.total(); n++) {
+			float exp0 = expf(tmp[2*n  ]);
+			float exp1 = expf(tmp[2*n+1]);
+			float p0 = exp0 / (exp0+exp1);
+			float p1 = exp1 / (exp0+exp1);
+			uint8_t val = (p0 < p1 ? 0 : 255);
+			out[n] = (val & 0xE0) | (out[n] >> 3);
     }
 
-    //merge output into frame
-    cv::Mat refined;
-    cv::Mat mask = cv::getStructuringElement(cv::MORPH_RECT, cv::Size(3, 3), cv::Point(-1, -1));
-    
-    cv::resize(frame, blend, cv::Size(src.cols,src.rows),cv::INTER_CUBIC);
-    cv::morphologyEx(blend, refined, cv::MORPH_OPEN, mask);
-    cv::morphologyEx(refined, refined, cv::MORPH_CLOSE, mask);
-    blend = refined.clone();
+    cv::Mat element = cv::getStructuringElement(cv::MORPH_RECT, cv::Size(3, 3), cv::Point(-1, -1));
+    cv::Mat tmpbuf;
+    //cv::dilate(ofinal,tmpbuf,element);
+    //cv::erode(tmpbuf,ofinal,element);
+    cv::morphologyEx(ofinal, tmpbuf, cv::MORPH_OPEN, element);
+    cv::morphologyEx(tmpbuf, ofinal, cv::MORPH_CLOSE, element);
 
+    // scale up into full-sized mask
+    cv::Mat refined;
+    cv::resize(ofinal, blend, cv::Size(src.cols, src.rows), cv::INTER_CUBIC);
     cv::GaussianBlur(blend, refined, cv::Size(0, 0), 3);
-    cv::addWeighted(src, 0.5, refined, 0.5, 0.0, src);
+    cv::Mat bgr[3] = {refined, refined, refined};
+
+    cv::Mat merged_mask;
+    cv::merge(bgr, 3, merged_mask);
+    cv::addWeighted(src, 0.5, merged_mask, 0.5, 0.0, src);
 }
 
 int main(){
-    std::unique_ptr<tflite::FlatBufferModel> model = tflite::FlatBufferModel::BuildFromFile("lite-model_deeplabv3_1_metadata_2.tflite");
+    std::unique_ptr<tflite::FlatBufferModel> model = tflite::FlatBufferModel::BuildFromFile("./models/segm_full_v679.tflite");
 
     if(!model){
         printf("Failed to mmap model\n");
@@ -103,6 +133,7 @@ int main(){
     }
 
     tflite::ops::builtin::BuiltinOpResolver resolver;
+    resolver.AddCustom("Convolution2DTransposeBias", mediapipe::tflite_operations::RegisterConvolution2DTransposeBias()); 
     tflite::InterpreterBuilder(*model.get(), resolver)(&interpreter);
 
     // Resize input tensors, if desired.
@@ -127,7 +158,7 @@ int main(){
     cv::Mat frame;
     cv::VideoWriter outputVideo;
     cv::Size outSize = cv::Size((int)cap.get(cv::CAP_PROP_FRAME_WIDTH), (int)cap.get(cv::CAP_PROP_FRAME_HEIGHT));
-	outputVideo.open("output.mp4", cv::VideoWriter::fourcc('m', 'p', '4', 'v'), 30, outSize, true);
+	outputVideo.open("/mnt/e/Data/output.mp4", cv::VideoWriter::fourcc('m', 'p', '4', 'v'), 30, outSize, true);
 
     while(1){
         cap >> frame;
