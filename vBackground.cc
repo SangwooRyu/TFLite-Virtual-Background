@@ -133,6 +133,7 @@ int main(){
     }
 
     tflite::ops::builtin::BuiltinOpResolver resolver;
+    //https://github.com/google/mediapipe/tree/master/mediapipe/util/tflite/operations
     resolver.AddCustom("Convolution2DTransposeBias", mediapipe::tflite_operations::RegisterConvolution2DTransposeBias()); 
     tflite::InterpreterBuilder(*model.get(), resolver)(&interpreter);
 
